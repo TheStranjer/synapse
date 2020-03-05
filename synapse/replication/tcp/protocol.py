@@ -55,11 +55,13 @@ from typing import Any, DefaultDict, Dict, List, Set
 
 from six import iteritems
 
+import txredisapi as redis
 from prometheus_client import Counter
 
 from twisted.protocols.basic import LineOnlyReceiver
 from twisted.python.failure import Failure
 
+from synapse.logging.context import PreserveLoggingContext
 from synapse.metrics import LaterGauge
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.replication.tcp.commands import (
@@ -420,6 +422,8 @@ class CommandHandler:
     def __init__(self, hs, handler):
         self.handler = handler
 
+        self.is_master = hs.config.worker.worker_app is None
+
         self.clock = hs.get_clock()
 
         self.streams = {
@@ -458,11 +462,22 @@ class CommandHandler:
         self.handler.lost_connection(connection)
 
     async def on_USER_SYNC(self, cmd: UserSyncCommand):
+        if not self.connection:
+            raise Exception("Not connected")
+
         await self.handler.on_user_sync(
             self.connection.conn_id, cmd.user_id, cmd.is_syncing, cmd.last_sync_ms
         )
 
     async def on_REPLICATE(self, cmd: ReplicateCommand):
+        # We only want to announce positions by the writer of the streams.
+        # Currently this is just the master process.
+        if not self.is_master:
+            return
+
+        if not self.connection:
+            raise Exception("Not connected")
+
         for stream_name, stream in self.streams.items():
             current_token = stream.current_token()
             self.connection.send_command(PositionCommand(stream_name, current_token))
@@ -483,15 +498,14 @@ class CommandHandler:
         self.handler.on_sync(cmd.data)
 
     async def on_RDATA(self, cmd: RdataCommand):
+
         stream_name = cmd.stream_name
         inbound_rdata_count.labels(stream_name).inc()
 
         try:
             row = STREAMS_MAP[stream_name].parse_row(cmd.row)
         except Exception:
-            logger.exception(
-                "[%s] Failed to parse RDATA: %r %r", self.id(), stream_name, cmd.row
-            )
+            logger.exception("[%s] Failed to parse RDATA: %r", stream_name, cmd.row)
             raise
 
         if cmd.token is None or stream_name in self.streams_connecting:
@@ -519,7 +533,7 @@ class CommandHandler:
             return
 
         # Fetch all updates between then and now.
-        limited = True
+        limited = cmd.token != current_token
         while limited:
             updates, current_token, limited = await stream.get_updates_since(
                 current_token, cmd.token
@@ -582,7 +596,7 @@ class AbstractReplicationClientHandler(metaclass=abc.ABCMeta):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def on_user_sync(
+    async def on_user_sync(
         self, conn_id: str, user_id: str, is_syncing: bool, last_sync_ms: int
     ):
         """A client has started/stopped syncing on a worker.
@@ -794,3 +808,112 @@ tcp_outbound_commands = LaterGauge(
 inbound_rdata_count = Counter(
     "synapse_replication_tcp_protocol_inbound_rdata_count", "", ["stream_name"]
 )
+
+
+class RedisSubscriber(redis.SubscriberProtocol):
+    def connectionMade(self):
+        logger.info("MADE CONNECTION")
+        self.subscribe(self.stream_name)
+        self.send_command(ReplicateCommand("ALL"))
+
+        self.handler.new_connection(self)
+
+    def messageReceived(self, pattern, channel, message):
+        if message.strip() == "":
+            # Ignore blank lines
+            return
+
+        line = message
+        cmd_name, rest_of_line = line.split(" ", 1)
+
+        cmd_cls = COMMAND_MAP[cmd_name]
+        try:
+            cmd = cmd_cls.from_line(rest_of_line)
+        except Exception as e:
+            logger.exception(
+                "[%s] failed to parse line %r: %r", self.id(), cmd_name, rest_of_line
+            )
+            self.send_error(
+                "failed to parse line for  %r: %r (%r):" % (cmd_name, e, rest_of_line)
+            )
+            return
+
+        # Now lets try and call on_<CMD_NAME> function
+        run_as_background_process(
+            "replication-" + cmd.get_logcontext_id(), self.handle_command, cmd
+        )
+
+    async def handle_command(self, cmd: Command):
+        """Handle a command we have received over the replication stream.
+
+        By default delegates to on_<COMMAND>, which should return an awaitable.
+
+        Args:
+            cmd: received command
+        """
+        # First call any command handlers on this instance. These are for TCP
+        # specific handling.
+        cmd_func = getattr(self, "on_%s" % (cmd.NAME,), None)
+        if cmd_func:
+            await cmd_func(cmd)
+
+        # Then call out to the handler.
+        cmd_func = getattr(self.handler, "on_%s" % (cmd.NAME,), None)
+        if cmd_func:
+            await cmd_func(cmd)
+
+    def connectionLost(self, reason):
+        logger.info("LOST CONNECTION")
+        self.handler.lost_connection(self)
+
+    def send_command(self, cmd):
+        """Send a command if connection has been established.
+
+        Args:
+            cmd (Command)
+        """
+        string = "%s %s" % (cmd.NAME, cmd.to_line())
+        if "\n" in string:
+            raise Exception("Unexpected newline in command: %r", string)
+
+        encoded_string = string.encode("utf-8")
+
+        async def _send():
+            with PreserveLoggingContext():
+                await self.redis_connection.publish(self.stream_name, encoded_string)
+
+        run_as_background_process("send-cmd", _send)
+
+    def stream_update(self, stream_name, token, data):
+        """Called when a new update is available to stream to clients.
+
+        We need to check if the client is interested in the stream or not
+        """
+        self.send_command(RdataCommand(stream_name, token, data))
+
+    def send_sync(self, data):
+        self.send_command(SyncCommand(data))
+
+    def send_remote_server_up(self, server: str):
+        self.send_command(RemoteServerUpCommand(server))
+
+
+class RedisFactory(redis.SubscriberFactory):
+
+    maxDelay = 5
+    continueTrying = True
+    protocol = RedisSubscriber
+
+    def __init__(self, hs, handler):
+        super(RedisFactory, self).__init__()
+
+        self.handler = CommandHandler(hs, handler)
+        self.stream_name = hs.hostname
+
+    def buildProtocol(self, addr):
+        p = super(RedisFactory, self).buildProtocol(addr)
+        p.handler = self.handler
+        p.redis_connection = redis.lazyConnection("redis")
+        p.conn_id = random_string(5)  # TODO: FIXME
+        p.stream_name = self.stream_name
+        return p

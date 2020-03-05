@@ -75,6 +75,7 @@ REQUIREMENTS = [
     "Jinja2>=2.9",
     "bleach>=1.4.3",
     "typing-extensions>=3.7.4",
+    "txredisapi",
 ]
 
 CONDITIONAL_REQUIREMENTS = {

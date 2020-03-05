@@ -22,7 +22,7 @@ from twisted.internet import defer
 from twisted.internet.protocol import ReconnectingClientFactory
 
 from synapse.replication.slave.storage._base import BaseSlavedStore
-from synapse.replication.tcp.protocol import (
+from synapse.replication.tcp.protocol import (  # RedisFactory,
     AbstractReplicationClientHandler,
     ClientReplicationStreamProtocol,
 )
@@ -107,10 +107,14 @@ class ReplicationClientHandler(AbstractReplicationClientHandler):
         using TCP.
         """
         client_name = hs.config.worker_name
-        self.factory = ReplicationClientFactory(hs, client_name, self)
         host = hs.config.worker_replication_host
         port = hs.config.worker_replication_port
+
+        self.factory = ReplicationClientFactory(hs, client_name, self)
         hs.get_reactor().connectTCP(host, port, self.factory)
+
+        # self.factory = RedisFactory(hs, self)
+        # hs.get_reactor().connectTCP("redis", 6379, self.factory)
 
     def new_connection(self, connection):
         self.connection = connection
@@ -122,7 +126,7 @@ class ReplicationClientHandler(AbstractReplicationClientHandler):
     def lost_connection(self, connection):
         self.connection = None
 
-    def on_user_sync(self, conn_id, user_id, is_syncing, last_sync_ms):
+    async def on_user_sync(self, conn_id, user_id, is_syncing, last_sync_ms):
         pass
 
     def federation_ack(self, token):
@@ -249,7 +253,7 @@ class ReplicationClientHandler(AbstractReplicationClientHandler):
         """Called when we have successfully subscribed and caught up to all
         streams we're interested in.
         """
-        logger.info("Finished connecting to server")
+        logger.debug("Finished connecting to server")
 
         # We don't reset the delay any earlier as otherwise if there is a
         # problem during start up we'll end up tight looping connecting to the
